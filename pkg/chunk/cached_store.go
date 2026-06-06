@@ -265,26 +265,33 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	if int(off)+len(p) > chunkSize {
 		return 0, fmt.Errorf("write out of chunk boudary: %d > %d", int(off)+len(p), chunkSize)
 	}
+	// 说明这段数据至少有部分已经写入store，不能覆盖
 	if off < int64(s.uploaded) {
 		return 0, fmt.Errorf("Cannot overwrite uploaded block: %d < %d", off, s.uploaded)
 	}
 
 	// Fill previous blocks with zeros
+	// 如果写入的偏移大于当前slice的长度，则填充0
 	if s.length < int(off) {
 		zeros := make([]byte, int(off)-s.length)
 		_, _ = s.WriteAt(zeros, int64(s.length))
 	}
 
+	// 按 block 和 page 维度，逐个写入
 	for n < len(p) {
+		// 计算写入数据在哪个block, n表示已经写入的数据量
 		indx := s.index(int(off) + n)
+		// 所在block的起始offset
 		boff := (int(off) + n) % s.store.conf.BlockSize
 		var bs = pageSize
 		if indx > 0 || bs > s.store.conf.BlockSize {
 			bs = s.store.conf.BlockSize
 		}
+		// 计算在当前block内的哪个page，以及对应起始偏移
 		bi := boff / bs
 		bo := boff % bs
 		var page *Page
+		// 如果当前block已经存在page，则复用
 		if bi < len(s.pages[indx]) {
 			page = s.pages[indx][bi]
 		} else {
@@ -350,6 +357,7 @@ func (store *cachedStore) delete(key string) error {
 	return err
 }
 
+// 压缩并上传block到store，带退避重试
 func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	sync := s != nil
 	blen := len(block.Data)
@@ -395,12 +403,16 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 }
 
 func (s *wSlice) upload(indx int) {
+	// 计算一下block index对应block的长度，因为可能最后一个block不是满的
 	blen := s.blockSize(indx)
+	// 按照格式拼出store层对应的key
 	key := s.key(indx)
 	pages := s.pages[indx]
 	s.pages[indx] = nil
+	// 表示有等待上传的slice
 	s.pendings++
 
+	// 起异步线程，首先将page从当前slice中脱钩拷贝出来
 	go func() {
 		var block *Page
 		var off int
@@ -417,10 +429,12 @@ func (s *wSlice) upload(indx int) {
 		if off != blen {
 			panic(fmt.Sprintf("block length does not match: %v != %v", off, blen))
 		}
+		// writeback模式 且 block长度小于阈值，则写入缓存
 		if s.writeback && blen < s.store.conf.WritebackThresholdSize {
 			stagingPath := "unknown"
 			stageFailed := false
 			block.Acquire()
+			// 写入缓存，如果超时但是写成功了，则会在回调里清理刚写入的缓存
 			err := utils.WithTimeout(context.TODO(), func(context.Context) (err error) { // In case it hangs for more than 5 minutes(see fileWriter.flush), fallback to uploading directly to avoid `EIO`
 				defer block.Release()
 				stagingPath, err = s.store.bcache.stage(key, block.Data)
@@ -436,6 +450,7 @@ func (s *wSlice) upload(indx int) {
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
 			} else {
+				// 写缓存失败，直接上传store
 				s.errors <- nil
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
 					select {
@@ -458,6 +473,7 @@ func (s *wSlice) upload(indx int) {
 				return
 			}
 		}
+		// 直写模式
 		s.store.currentUpload <- struct{}{}
 		defer func() { <-s.store.currentUpload }()
 		s.errors <- s.store.upload(key, block, s)
@@ -472,6 +488,7 @@ func (s *wSlice) Len() int {
 	return s.length
 }
 
+// 把当前已经上传的数据到指定offset之间，已经写满整个block的数据，逐个刷下去
 func (s *wSlice) FlushTo(offset int) error {
 	if offset < s.uploaded {
 		panic(fmt.Sprintf("Invalid offset: %d < %d", offset, s.uploaded))
@@ -490,6 +507,7 @@ func (s *wSlice) FlushTo(offset int) error {
 	return nil
 }
 
+// 刷写整个slice
 func (s *wSlice) Finish(length int) error {
 	if s.length != length {
 		return fmt.Errorf("Length mismatch: %v != %v", s.length, length)
@@ -660,22 +678,31 @@ func (c *Config) CacheEnabled() bool {
 }
 
 type cachedStore struct {
-	storage         object.ObjectStorage
-	bcache          CacheManager
-	fetcher         *prefetcher
-	conf            Config
-	group           *Controller
+	// 持久化存储引擎
+	storage object.ObjectStorage
+	// 缓存管理器
+	bcache CacheManager
+	// 预加载器
+	fetcher *prefetcher
+	conf    Config
+	// 管理同一个key的读取，只发起一次load，其他协程等待并复用同一份数据
+	group *Controller
+	// 通过channel限制上传、并发
 	currentUpload   chan struct{}
 	currentDownload chan struct{}
-	pendingCh       chan *pendingItem
-	pendingKeys     map[string]*pendingItem
-	pendingMutex    sync.Mutex
-	startHour       int
-	endHour         int
-	compressor      compress.Compressor
-	seekable        bool
-	upLimit         *ratelimit.Bucket
-	downLimit       *ratelimit.Bucket
+	// 在writeback模式下，上传的队列
+	pendingCh chan *pendingItem
+	// key → 待上传项
+	pendingKeys  map[string]*pendingItem
+	pendingMutex sync.Mutex
+	// writeback 时间窗口
+	startHour  int
+	endHour    int
+	compressor compress.Compressor
+	seekable   bool
+	// 限流
+	upLimit   *ratelimit.Bucket
+	downLimit *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -748,6 +775,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	return 0, errTryFullRead
 }
 
+// 从store拉取数据
 func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
 	defer func() {
 		e := recover()
@@ -858,6 +886,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 			logger.Infof("background upload at %d:00 ~ %d:00", store.startHour, store.endHour)
 		}
 	}
+	// 这里的匿名函数，就是后续异步刷写的回调
 	store.bcache = newCacheManager(&config, reg, func(key, fpath string, force bool) bool {
 		if fi, err := os.Stat(fpath); err == nil {
 			return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
@@ -867,6 +896,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	})
 
+	// 定期查询缓存是否还有空间，没有则切换到内存缓存
 	go func() {
 		for {
 			if store.bcache.isEmpty() {

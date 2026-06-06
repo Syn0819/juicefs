@@ -51,6 +51,8 @@ func readSlice(store chunk.ChunkStore, s *meta.Slice, page *chunk.Page, off int)
 	return nil
 }
 
+// 实际执行meta compact chunk
+// 因为要服用vfs层slice写入的相关逻辑
 func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id uint64) error {
 	for utils.AllocMemory()-store.UsedMemory() > int64(conf.BufferSize)*3/2 {
 		time.Sleep(time.Millisecond * 100)
@@ -66,7 +68,11 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 	writer.SetWriteback(false)
 
 	var pos int
+	// 遍历所有slice
 	for i, s := range slices {
+		// 如果Id为0，说明是空洞，写入零字节填充
+		// 什么情况下为0？
+		// 文件中有从未写入过数据的区域（sparse file 的空洞），或者某段区域被截断（truncate）后形成的逻辑空白。这部分在 buildSlice 合并时会产生 Id=0 的占位 slice，表示"这段范围内容为全零"。处理方式是直接分配一块零字节缓冲区写入新对象，确保新对象的字节偏移是对齐连续的
 		if s.Id == 0 {
 			_, err := writer.WriteAt(make([]byte, int(s.Len)), int64(pos))
 			if err != nil {
@@ -77,6 +83,7 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 			continue
 		}
 		var read int
+		// 不断从slice中读取数据，直到读完
 		for read < int(s.Len) {
 			l := min(conf.BlockSize, int(s.Len)-read)
 			p := chunk.NewOffPage(l)
@@ -94,6 +101,7 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 				return err
 			}
 			read += l
+			// 满一个block即写入存储层
 			if pos+read >= conf.BlockSize {
 				if err = writer.FlushTo(pos + read); err != nil {
 					panic(err)
@@ -102,6 +110,7 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 		}
 		pos += int(s.Len)
 	}
+	// 写入新slice
 	err := writer.Finish(pos)
 	if err != nil {
 		writer.Abort()

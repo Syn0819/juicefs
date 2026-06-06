@@ -122,9 +122,9 @@ type SecurityConfig struct {
 }
 
 type Config struct {
-	Meta                 *meta.Config
-	Format               meta.Format
-	Chunk                *chunk.Config
+	Meta                 *meta.Config  // 功能配置参数
+	Format               meta.Format   // ms参数配置
+	Chunk                *chunk.Config // cache参数配置
 	Security             *SecurityConfig
 	Port                 *Port
 	Version              string
@@ -173,9 +173,12 @@ var (
 	})
 )
 
+// 核心流程，查找文件元数据
 func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
 	var inode Ino
 	var attr = &Attr{}
+	// 根据parent inode和文件name，查询文件的元数据
+	// 如果是内部文件，直接查询内存表，不用走meta
 	if parent == rootID || name == internalNodes[0].name { // 0 is the control file
 		n := getInternalNodeByName(name)
 		if n != nil {
@@ -436,6 +439,7 @@ func (v *VFS) UpdateLength(inode Ino, attr *meta.Attr) {
 	}
 }
 
+// 流式list dir
 func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plus bool) (entries []*meta.Entry, readAt time.Time, err syscall.Errno) {
 	defer func() { logit(ctx, "readdir", err, "(%d,%d,%d,%t): (%d)", ino, size, off, plus, len(entries)) }()
 	h := v.findHandle(ino, fh)
@@ -461,6 +465,8 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 				})
 			}
 		}
+		// 第一次建立或重置dirHandler，更新时间
+		// 上次会判断readAt
 		h.readAt = time.Now()
 		if h.dirHandler, err = v.Meta.NewDirHandler(ctx, ino, plus, initEntries); err != 0 {
 			if plus && err == syscall.EACCES {
@@ -471,6 +477,8 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 			}
 		}
 	}
+
+	// 任何会改变目录内容的操作（Mknod、Mkdir、Unlink、Rmdir、Symlink、Rename、Link、Create）成功后都会调用 invalidateDirHandle来增减条目，以保证缓存一致性
 	if entries, err = h.dirHandler.List(ctx, off); err != 0 {
 		return
 	}
@@ -586,6 +594,7 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 
 	err = v.Meta.Open(ctx, ino, flags, attr)
 	if err == 0 {
+		// 可能别的句柄正在写，还在缓冲区，那么需要先补齐，读视图也更新到该长度
 		v.UpdateLength(ino, attr)
 		fh = v.newFileHandle(ino, attr.Length, flags)
 		entry = &meta.Entry{Inode: ino, Attr: attr}
@@ -690,6 +699,7 @@ func hasReadPerm(flag uint32) bool {
 	return (flag & O_ACCMODE) != syscall.O_WRONLY
 }
 
+// 读流程
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
@@ -750,6 +760,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 		return
 	}
+    // 如果这个句柄是被恢复出来的，需要重新打开文件
 	if h.flags&O_RECOVERED != 0 {
 		// recovered
 		var attr Attr
@@ -780,12 +791,14 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 		return
 	}
+	// 读写锁
 	if !h.Rlock(ctx) {
 		err = syscall.EINTR
 		return
 	}
 	defer h.Runlock()
 
+	// 把该inode所有未刷写的写缓存写下去，并提交元数据。保证读到刚写完但是还没fsync的数据
 	_ = v.writer.Flush(ctx, ino)
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
@@ -814,10 +827,13 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 		return
 	}
 
+	// 如果是控制操作，会写入内部文件，并用后台线程处理
 	if ino == controlInode {
 		h.Lock()
 		defer h.Unlock()
+		// 内核可能把一次用户的write拆分成多段FUSE write，所以先追到到buf
 		h.pending = append(h.pending, buf...)
+		// 再检查buf中的数据是不是存在完整的一次write操作
 		rb := utils.ReadBuffer(h.pending)
 		cmd := rb.Get32()
 		size := int(rb.Get32())
@@ -829,6 +845,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 		h.pending = h.pending[:0]
 		if rb.Left() == size {
 			h.bctx = meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids())
+			// 后台处理
 			go v.handleInternalMsg(h.bctx, cmd, rb, h)
 		} else {
 			logger.Warnf("broken message: %d %d < %d", cmd, size, rb.Left())
@@ -1222,22 +1239,22 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 var logger = utils.GetLogger("juicefs")
 
 type VFS struct {
-	Conf            *Config
-	Meta            meta.Meta
-	Store           chunk.ChunkStore
+	Conf            *Config          // 配置信息
+	Meta            meta.Meta        // 元数据引擎接口
+	Store           chunk.ChunkStore // 存储引擎接口
 	InvalidateEntry func(parent meta.Ino, name string) syscall.Errno
 	UpdateFormat    func(*meta.Format)
-	reader          DataReader
+	reader          DataReader // 对数据IO的封装
 	writer          DataWriter
 	cacheFiller     *CacheFiller
 
-	handles   map[Ino][]*handle
-	handleIno map[uint64]Ino
+	handles   map[Ino][]*handle // inode -> 句柄列表
+	handleIno map[uint64]Ino    //  fh -> inode
 	hanleM    sync.Mutex
-	nextfh    uint64
+	nextfh    uint64 // 下一个 fh
 
 	modM       sync.Mutex
-	modifiedAt map[Ino]time.Time
+	modifiedAt map[Ino]time.Time // 记录最近被修改过的inode以及修改时间
 
 	registry *prometheus.Registry
 }
@@ -1260,6 +1277,7 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		registry:    registry,
 	}
 
+	// 定了一些内部文件，需要先获取
 	n := getInternalNode(ConfigInode)
 	v.Conf.Format.RemoveSecret()
 	data, _ := json.MarshalIndent(v.Conf, "", " ")
@@ -1278,6 +1296,8 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	if statePath == "" {
 		statePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}
+	// _FUSE_STATE_PATH这里保存的是挂载进程的句柄状态，在重启时可以直接全部恢复出来
+	// 什么时候写的？旧进程收到 SIGHUP 做“优雅退出/升级”时，在退出前会先刷数据，再把自己的所有打开句柄保存到同一个路径
 	if err := v.loadAllHandles(statePath); err != nil && !os.IsNotExist(err) {
 		logger.Errorf("load state from %s: %s", statePath, err)
 	}
@@ -1301,6 +1321,8 @@ func (v *VFS) ModifiedSince(ino Ino, start time.Time) bool {
 	return ok && t.After(start)
 }
 
+// 定期清理，避免内存泄漏
+// 只删除超过 30 秒没再被更新过的 inode
 func (v *VFS) cleanupModified() {
 	for {
 		v.modM.Lock()

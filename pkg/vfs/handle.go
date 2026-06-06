@@ -32,14 +32,19 @@ import (
 type handle struct {
 	sync.Mutex
 	inode Ino
-	fh    uint64
+	// 为什么光inode不够？
+	// 		因为一个文件，即一个inode，在客户端可能被打开多次，对应多个句柄，而句柄之间也需要唯一标识
+	fh uint64
 
 	// for dir
+	// 目录句柄，用于判断readdir缓存与失效判断
+	// 	读取流程dir的流程是流式的，按照offset流式返回目录的条目，并能在本机目录被修改时做增量更新（Insert/Delete），而不是每次都重扫 Meta
 	dirHandler meta.DirHandler
-	readAt     time.Time
+	// 本次视图建立的时间
+	readAt time.Time
 
 	// for file
-	flags      uint32
+	flags      uint32 // 文件打开标志，O_RDONLY / O_WRONLY等
 	locks      uint8
 	flockOwner uint64 // kernel 3.1- does not pass lock_owner in release()
 	ofdOwner   uint64 // OFD lock
@@ -48,9 +53,10 @@ type handle struct {
 	ops        []Context
 
 	// rwlock
-	writing uint32
-	readers uint32
-	writers uint32
+	// 读写锁
+	writing uint32 // 0/1，仅表示是否持有写锁
+	readers uint32 // 持有读锁的数量
+	writers uint32 // 正在排队等待写锁的数量
 	cond    *utils.Cond
 
 	// internal files
@@ -100,6 +106,7 @@ func (h *handle) cancelOp(pid uint32) {
 
 func (h *handle) Rlock(ctx Context) bool {
 	h.Lock()
+	// 没有正在写的、也没有在等写的，才允许新读者进来
 	for (h.writing | h.writers) != 0 {
 		if h.cond.WaitWithTimeout(time.Second) && ctx.Canceled() {
 			h.Unlock()
@@ -124,9 +131,12 @@ func (h *handle) Runlock() {
 
 func (h *handle) Wlock(ctx Context) bool {
 	h.Lock()
+	// 直接增加写锁等待者计数
 	h.writers++
+	// 没有读者、也没有正在写的
 	for (h.readers | h.writing) != 0 {
 		if h.cond.WaitWithTimeout(time.Second) && ctx.Canceled() {
+			// 拿到锁后就不算排队了
 			h.writers--
 			h.Unlock()
 			logger.Warnf("write lock %d interrupted", h.inode)
@@ -161,6 +171,8 @@ func (h *handle) Close() {
 func (v *VFS) newHandle(inode Ino, readOnly bool) *handle {
 	v.hanleM.Lock()
 	defer v.hanleM.Unlock()
+	// 以最低位即是否只读来区分，1为只读，0为读写
+	// 即只读的句柄fh必是奇数
 	var lowBits uint64
 	if readOnly {
 		lowBits = 1
@@ -239,6 +251,7 @@ func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32) uint64 {
 	h.Lock()
 	defer h.Unlock()
 	h.flags = flags
+	// O_ACCMODE 访问模式掩码，在文件标识中最后两位是访问模式，在与掩码按位与之后就能过滤其他无关标志
 	switch flags & O_ACCMODE {
 	case syscall.O_RDONLY:
 		h.reader = v.reader.Open(inode, length)
@@ -264,6 +277,9 @@ func (v *VFS) releaseFileHandle(ino Ino, fh uint64) {
 	}
 }
 
+// 在目录被修改时，通知所有正在读这个目录的handle，让其缓存与当前目录内容一致
+// 这样这个句柄继续readdir时不会漏掉或重复条目
+// 在所有会改变目录内容的VFS操作后调用
 func (v *VFS) invalidateDirHandle(parent Ino, name string, inode Ino, attr *Attr) {
 	v.hanleM.Lock()
 	hs := v.handles[parent]

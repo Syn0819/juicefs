@@ -81,6 +81,7 @@ $ juicefs mount redis://localhost /mnt/jfs --backup-meta 0`,
 	}
 }
 
+// 启动后台http监控服务，使用Prometheus
 func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *prometheus.Registry) string {
 	var ip, port string
 	// default set
@@ -205,6 +206,7 @@ func relPathToAbs(ss []string) []string {
 	return ss
 }
 
+// 在进程daemon化之前，将相对路径转换成绝对路径
 func cacheDirPathToAbs(c *cli.Context) {
 	if runtime.GOOS != "windows" {
 		if cd := c.String("cache-dir"); cd != "memory" {
@@ -444,6 +446,13 @@ func (h *storageHolder) Shutdown() {
 	object.Shutdown(h.ObjectStorage)
 }
 
+// 创建存储层句柄
+// 支持在不重新挂载的情况下更换后端存储证书（AK/SK）或 Bucket
+// cli.OnReload 注册一个回调。当元数据中的配置发生变化时，它会自动创建一个新的 ObjectStorage 实例替换旧的
+
+// config是如何被修改的呢？
+//
+//	通过 juicefs config 命令，将config保存到元数据请求，然后客户端后台请求去拉
 func NewReloadableStorage(format *meta.Format, cli meta.Meta, patch func(*meta.Format)) (object.ObjectStorage, error) {
 	if patch != nil {
 		patch(format)
@@ -540,6 +549,7 @@ func mount(c *cli.Context) error {
 	if stage < 0 || stage > 2 {
 		logger.Fatalf("Invalid daemon stage: %d", stage)
 	}
+	// 如果JFS_SUPERVISOR环境变量存在，则跳过stage 0和stage 1，直接进入stage 3
 	supervisor := os.Getenv("JFS_SUPERVISOR")
 	if supervisor != "" || runtime.GOOS == "windows" {
 		stage = 3
@@ -547,6 +557,7 @@ func mount(c *cli.Context) error {
 
 	var err error
 	if stage == 0 || supervisor == "test" {
+		// 将相对路径转为绝对路径
 		err = utils.WithTimeout(context.TODO(), func(context.Context) error {
 			mp, err = filepath.Abs(mp)
 			return err
@@ -554,10 +565,15 @@ func mount(c *cli.Context) error {
 		if err != nil {
 			logger.Fatalf("abs %s: %s", mp, err)
 		}
+		// 禁止将 JuiceFS 直接挂载到系统的根目录
 		if mp == "/" {
 			logger.Fatalf("should not mount on the root directory")
 		}
+		// 检查挂载点路径
 		prepareMp(mp)
+
+		// update-fstab标志
+		// 标识需要写入系统的挂载配置文件 /etc/fstab
 		if runtime.GOOS == "linux" && c.Bool("update-fstab") && !calledViaMount(os.Args) && !insideContainer() {
 			if os.Getuid() != 0 {
 				logger.Warnf("--update-fstab should be used with root")
@@ -579,6 +595,7 @@ func mount(c *cli.Context) error {
 	var format = &meta.Format{}
 	var metaCli meta.Meta
 	var blob object.ObjectStorage
+	// 解析meta参数
 	metaConf := getMetaConf(c, mp, c.Bool("read-only") || utils.StringContains(strings.Split(c.String("o"), ","), "ro"))
 	if runtime.GOOS == "windows" {
 		metaConf.CaseInsensi = !c.Bool("case-sensitive")
@@ -586,6 +603,8 @@ func mount(c *cli.Context) error {
 	// stage 0: check the connection to fail fast
 	// stage 2: need the volume name to check if it's already mounted
 	// stage 3: the real service process
+	// 对于stage 0，是预检，防止参数配置有误，连不上元数据
+	// 对于stage 2,3 ？
 	if stage != 1 {
 		metaCli = meta.NewClient(addr, metaConf)
 		format, err = metaCli.Load(true)
@@ -594,6 +613,7 @@ func mount(c *cli.Context) error {
 		}
 	}
 
+	// 解析参数配置
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
@@ -608,6 +628,7 @@ func mount(c *cli.Context) error {
 
 	if stage < 3 {
 		// supervisor serves no user request
+		// 非执行进程，不持有元数据和存储层句柄
 		if metaCli != nil {
 			if err = metaCli.Shutdown(); err != nil {
 				logger.Errorf("[pid=%d] meta shutdown: %s", os.Getpid(), err)
@@ -626,6 +647,7 @@ func mount(c *cli.Context) error {
 			}
 			object.Shutdown(blob)
 		}
+		// 如果设置了是前台直接运行，则直接挂载，否则走deamon
 		var foreground bool
 		if runtime.GOOS == "windows" || !c.Bool("background") || os.Getenv("JFS_FOREGROUND") != "" {
 			foreground = true
@@ -639,6 +661,7 @@ func mount(c *cli.Context) error {
 		} else {
 			daemonRun(c, addr, vfsConf) // only stage 0 needs the vfsConf
 		}
+		// 设置标志，表示daemon设置成功
 		os.Setenv("JFS_SUPERVISOR", strconv.Itoa(os.Getppid()))
 		return launchMount(c, mp, vfsConf)
 	} else if runtime.GOOS == "windows" && c.Bool("background") {
@@ -652,6 +675,7 @@ func mount(c *cli.Context) error {
 		vfsConf.StatePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}
 
+	// 把元数据视角的根目录设置为subdir，即用户挂载的可能是个子路径
 	if st := metaCli.Chroot(meta.Background(), metaConf.Subdir); st != 0 {
 		return st
 	}
@@ -661,20 +685,25 @@ func mount(c *cli.Context) error {
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
 
+	// 每个挂载进程都要创建一个session，使得元数据能管理挂载点
 	err = metaCli.NewSession(true)
 	if err != nil {
 		logger.Fatalf("new session: %s", err)
 	}
 
+	// 注册回掉，当有配置变更时，回调至挂载进程
 	metaCli.OnReload(func(fmt *meta.Format) {
 		updateFormat(c)(fmt)
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	// 信号处理
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
+	// 挂载主循环
 	mountMain(v, c)
+	// 进程退出，还所有数据写下存储层
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}

@@ -91,19 +91,26 @@ func (r *frange) include(a *frange) bool { return r.off <= a.off && a.end() <= r
 
 // protected by file
 type sliceReader struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	file       *fileReader
-	block      *frange
-	state      sstate
-	page       *chunk.Page
-	indx       uint32
+	ctx    context.Context
+	cancel context.CancelFunc
+	file   *fileReader
+	// 该slice在文件中的区间
+	block *frange
+	// 数据获取状态
+	// NEW/BUSY/REFRESH/READY/BREAK/INVALID
+	state sstate
+	// 实际数据
+	page *chunk.Page
+	// chunk index = block.off / chunk size
+	indx uint32
+	// 成功读到的字节数
 	currentPos uint32
 	lastAccess time.Time
 	cond       *utils.Cond
-	next       *sliceReader
-	prev       **sliceReader
-	refs       uint16
+	// 链表指针
+	next *sliceReader
+	prev **sliceReader
+	refs uint16
 }
 
 func (s *sliceReader) delay(delay time.Duration) {
@@ -159,6 +166,9 @@ func retry_time(trycnt uint32) time.Duration {
 	return time.Second * 10
 }
 
+// 在slice创建时，后台运行
+// 将这一段指定的文件区间 从元数据和store 读到page中，成功后把状态设置为READY
+// 让 fileReader.Read → waitForIO 能从 page.Data 拷到用户 buf
 func (s *sliceReader) run() {
 	f := s.file
 	f.Lock()
@@ -166,11 +176,13 @@ func (s *sliceReader) run() {
 	if s.state != NEW || f.shouldStop() {
 		s.done(0, 0)
 	}
+	// 上锁，设置状态BUSY
 	s.state = BUSY
 	indx := s.indx
 	inode := f.inode
 	f.Unlock()
 
+	// 获取该chunk 这段逻辑区间包含的slice列表
 	var slices []meta.Slice
 	err := f.r.m.Read(meta.Background(), inode, indx, &slices)
 	f.Lock()
@@ -191,11 +203,13 @@ func (s *sliceReader) run() {
 	}
 
 	s.currentPos = 0
+	// 如果该slice的起始位置已经超出了文件长度，则直接设置为READY
 	if s.block.off > length {
 		s.block.len = 0
 		s.state = READY
 		s.done(0, 0)
 	} else if s.block.end() > length {
+		// 部分超过当前文件长度，截断
 		s.block.len = length - s.block.off
 	}
 	need := s.block.len
@@ -205,6 +219,7 @@ func (s *sliceReader) run() {
 	defer p.Release()
 	var n int
 
+	// 从store读取数据
 	ctx := context.WithValue(s.ctx, meta.CtxKey("inode"), inode) // Output inode in log for debugging
 	n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
 
@@ -231,6 +246,7 @@ func (s *sliceReader) run() {
 	}
 }
 
+// 在存在写 或 truncate时，导致该slice失效，需要重新读取
 func (s *sliceReader) invalidate() {
 	switch s.state {
 	case NEW:
@@ -281,21 +297,27 @@ type session struct {
 	atime      time.Time
 }
 
+// 单次open的读视图
 type fileReader struct {
 	// protected by itself
-	inode    Ino
-	length   uint64
-	err      syscall.Errno
-	tried    uint32
+	inode  Ino
+	length uint64
+	err    syscall.Errno
+	tried  uint32
+	// 两个读会话
+	// 	？？
 	sessions [readSessions]session
-	slices   *sliceReader
-	last     **sliceReader
+	// 用链表来管理所有slice
+	slices *sliceReader  // 链表头
+	last   **sliceReader // 链表尾后的next
 
 	sync.Mutex
 	closing bool
 
 	// protected by r
+	// 引用计数，并发读该句柄的数量
 	refs uint16
+	// 同一个inode下的下一个fileReader
 	next *fileReader
 	r    *dataReader
 }
@@ -325,6 +347,7 @@ func (f *fileReader) newSlice(block *frange) *sliceReader {
 	block.len -= s.block.len
 	s.page = chunk.NewOffPage(int(s.block.len))
 	s.cond = utils.NewCond(&f.Mutex)
+	// 新的slice插入到尾部
 	s.prev = f.last
 	*(f.last) = s
 	f.last = &(s.next)
@@ -460,6 +483,13 @@ func (f *fileReader) need(block *frange) bool {
 }
 
 // cleanup unused requests
+// 每次都会调用，来清理一些slice
+// 包括：
+//
+//		状态已无效
+//		超过30s未访问
+//		不在当前读模式需要的范围内
+//	 如果与block不重叠的slice数量超过上限，也会清理掉
 func (f *fileReader) cleanupRequests(block *frange) {
 	now := time.Now()
 	var cnt int
@@ -498,6 +528,7 @@ func (f *fileReader) releaseIdleBuffer() {
 	})
 }
 
+// 将本次读区间，与现有slice进行合并，如果有重叠的范围，就将所有重叠slice的start 和 end进行排序
 func (f *fileReader) splitRange(block *frange) []uint64 {
 	ranges := []uint64{block.off, block.end()}
 	contain := func(p uint64) bool {
@@ -589,10 +620,12 @@ func (f *fileReader) shouldStop() bool {
 	return f.err != 0 || f.closing
 }
 
+// 等待IO完成
 func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, syscall.Errno) {
 	start := time.Now()
 	for _, req := range reqs {
 		s := req.s
+		// 如果不是READY状态，或者目前读到的slice data size小于所需的，说明数据还没读完
 		for s.state != READY && uint64(s.currentPos) < s.block.len {
 			if s.cond.WaitWithTimeout(time.Second) {
 				if ctx.Canceled() {
@@ -606,6 +639,7 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 		}
 	}
 
+	// 全部读到后，依次按顺序拷贝到用户buf
 	var n int
 	for _, req := range reqs {
 		s := req.s
@@ -624,14 +658,19 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 }
 
 func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, syscall.Errno) {
+	// 限流，如果目前读的数据已经超过阈值，就sleep 10ms，如果超过两倍阈值就sleep 100ms
 	if f.r.readBufferUsed() > f.r.bufferSize {
 		time.Sleep(time.Millisecond * 10)             // slow down
 		for f.r.readBufferUsed() > f.r.bufferSize*2 { // readahead uses 80% of buffer, stop here to avoid OOM
 			time.Sleep(time.Millisecond * 100)
 		}
 	}
+
+	// 写锁
 	f.Lock()
 	defer f.Unlock()
+	// 增加引用计数
+	// TODO：引用计数有什么作用？
 	f.acquire()
 	defer f.release()
 
@@ -639,6 +678,7 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 		return 0, f.err
 	}
 
+	// 只能读到最新长度
 	size := uint64(len(buf))
 	if offset >= f.length || size == 0 {
 		return 0, 0
@@ -649,6 +689,8 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	}
 
 	f.cleanupRequests(block)
+	// 如果本次读的起始位置已经接近文件尾
+	// 构造一个last block，提前加载尾部内容
 	var lastBS uint64 = 32 << 10
 	if block.off+lastBS > f.length {
 		lastblock := frange{f.length - lastBS, lastBS}
@@ -657,7 +699,10 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 		}
 		f.readAhead(&lastblock)
 	}
+
+	// 找出所有与本次读区间重叠的slice，并进行合并，获取需要真正去读取的区间
 	ranges := f.splitRange(block)
+	// 构造需要真正去读取的req
 	reqs := f.prepareRequests(ranges)
 	defer func() {
 		for _, req := range reqs {
@@ -695,8 +740,11 @@ func (f *fileReader) Close(ctx meta.Context) {
 
 type dataReader struct {
 	sync.Mutex
-	m              meta.Meta
-	store          chunk.ChunkStore
+	m     meta.Meta
+	store chunk.ChunkStore
+	// 每个inode 对应的fileReader链表
+	// 为什么需要维护？
+	// 	比如truncate时，需要对该inode下所有fileReader更新length，并invalide超出长度的slice
 	files          map[Ino]*fileReader
 	blockSize      uint64
 	bufferSize     int64
@@ -837,6 +885,7 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 	return nil
 }
 
+// 从store中读取数据
 func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {
 	if len(slices) > 16 {
 		return r.readManySlices(ctx, page, slices, offset)
@@ -848,7 +897,9 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
 	buf := page.Data
 	size := len(buf)
 	for i := 0; i < len(slices); i++ {
+		// page剩余空间够 并且 读取范围在slice内，开始读取
 		if read < size && offset < pos+slices[i].Len {
+			// 读多少字节
 			toread := min(size-read, int(pos+slices[i].Len-offset))
 			go func(s *meta.Slice, p *chunk.Page, off, pos uint32) {
 				defer p.Release()
@@ -860,6 +911,7 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
 		}
 		pos += slices[i].Len
 	}
+	// 如果page还没填满，剩余位置填0
 	for read < size {
 		buf[read] = 0
 		read++
@@ -878,6 +930,7 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
 	return read
 }
 
+// 有并发的读
 func (r *dataReader) readManySlices(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {
 	read := 0
 	var pos uint32

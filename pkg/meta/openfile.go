@@ -10,6 +10,7 @@ const (
 	invalidateAttrOnly  = 0xFFFFFFFE
 )
 
+// 用了 Go 语言标准库的 sync.Pool 进行对象池化
 var ofPool = sync.Pool{
 	New: func() interface{} {
 		return &openFile{}
@@ -18,11 +19,14 @@ var ofPool = sync.Pool{
 
 type openFile struct {
 	sync.RWMutex
-	attr      Attr
-	refs      int
+	attr Attr
+	refs int
+	// 最后一次校验/更新元数据的时间戳，用于判断缓存是否过期
 	lastCheck int64
-	first     []Slice
-	chunks    map[uint32][]Slice
+	// 针对第一个chunk的优化，单独存储
+	// 因为绝大部分文件都很小，只有一个chunk，可以节省map的开销
+	first  []Slice
+	chunks map[uint32][]Slice
 }
 
 func (o *openFile) invalidateChunk() {
@@ -32,6 +36,7 @@ func (o *openFile) invalidateChunk() {
 	}
 }
 
+// 放回内存池
 func (o *openFile) release() {
 	o.attr = Attr{}
 	o.refs = 0
@@ -58,6 +63,8 @@ func newOpenFiles(expire time.Duration, limit uint64) *openfiles {
 	return of
 }
 
+// 在全局句柄缓存管理器初始化时启动
+// 后台协程实现高效且相对平滑的缓存淘汰策略
 func (o *openfiles) cleanup() {
 	for {
 		var (
@@ -66,16 +73,19 @@ func (o *openfiles) cleanup() {
 			candidateOf         *openFile
 		)
 		o.Lock()
+		// 检查缓存数量是否超过了 limit。如果超限，需要计算出需要删除的数量 todel
 		if o.limit > 0 && len(o.files) > int(o.limit) {
 			todel = len(o.files) - int(o.limit)
 		}
 		now := time.Now().Unix()
+		// 通过 range o.files 遍历字典。为了防止单次锁占用时间过长阻塞正常读写，单次最多只遍历 1000 个文件
 		for ino, of := range o.files {
 			cnt++
 			if cnt > 1e3 || todel > 0 && deleted >= todel {
 				break
 			}
 			if of.refs <= 0 {
+				// 如果 refs <= 0（文件已关闭）且超过 12 小时没有被访问过，直接释放并删除
 				if now-of.lastCheck > 3600*12 {
 					of.release()
 					delete(o.files, ino)
@@ -90,6 +100,8 @@ func (o *openfiles) cleanup() {
 					candidateOf = of
 					continue
 				}
+				// 如果当前缓存数超过了 limit，它会在遍历过程中比较相邻文件的 lastCheck 时间戳
+				// 每次都将较旧的那个（即更久未被访问的）淘汰掉，直到腾出足够的空间
 				if of.lastCheck < candidateOf.lastCheck {
 					candidateIno = ino
 					candidateOf = of
@@ -101,10 +113,13 @@ func (o *openfiles) cleanup() {
 			}
 		}
 		o.Unlock()
+		// time.Sleep 的时间是根据遍历和删除的比例动态计算的
+		// 工作量大时休息时间短，工作量小时休息时间长，巧妙地平衡了 CPU 占用和清理效率
 		time.Sleep(time.Millisecond * time.Duration(1000*(cnt+1-deleted*2)/(cnt+1)))
 	}
 }
 
+// 尝试打开，如果缓存存在其没过期，则直接返回句柄
 func (o *openfiles) OpenCheck(ino Ino, attr *Attr) bool {
 	o.Lock()
 	defer o.Unlock()
@@ -124,11 +139,13 @@ func (o *openfiles) Open(ino Ino, attr *Attr) {
 	defer o.Unlock()
 	of, ok := o.files[ino]
 	if !ok {
+		// 缓存中没有，从内存池获取
 		of = ofPool.Get().(*openFile)
 		o.files[ino] = of
 	} else if attr != nil && attr.Mtime == of.attr.Mtime && attr.Mtimensec == of.attr.Mtimensec {
 		attr.KeepCache = of.attr.KeepCache
 	} else {
+		// 如果文件被修改过，需要使原来的句柄失效
 		of.invalidateChunk()
 	}
 	if attr != nil {
@@ -151,6 +168,7 @@ func (o *openfiles) Close(ino Ino) bool {
 	return true
 }
 
+// 读取元数据。只有当 lastCheck 在 expire 期限内 元数据才算有效
 func (o *openfiles) Check(ino Ino, attr *Attr) bool {
 	if attr == nil {
 		panic("attr is nil")
@@ -165,6 +183,8 @@ func (o *openfiles) Check(ino Ino, attr *Attr) bool {
 	return false
 }
 
+// 更新元数据。这里同样会比对修改时间（Mtime 和 Mtimensec）
+// 如果发现文件被其他客户端修改了，会立即清空对应的 Chunk 缓存
 func (o *openfiles) Update(ino Ino, attr *Attr) bool {
 	if attr == nil {
 		return false

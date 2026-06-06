@@ -71,23 +71,30 @@ type pendingFile struct {
 }
 
 type cacheStore struct {
+	// UUID，用于一致性哈希
 	id         string
 	totalPages int64
 	sync.Mutex
+	// 缓存目录
 	dir           string
 	mode          os.FileMode
 	maxStageWrite int
-	capacity      int64
-	maxItems      int64
-	freeRatio     float32
-	hashPrefix    bool
-	scanInterval  time.Duration
-	cacheExpire   time.Duration
-	pending       chan pendingFile
-	pages         map[string]*Page
-	m             *cacheManagerMetrics
+	// 最大字节和最大item数
+	capacity int64
+	maxItems int64
+	// 保留空间比例
+	freeRatio    float32
+	hashPrefix   bool
+	scanInterval time.Duration
+	cacheExpire  time.Duration
+	// 待写入磁盘的队列
+	pending chan pendingFile
+	// 缓存页
+	pages map[string]*Page
+	m     *cacheManagerMetrics
 
-	used      int64
+	used int64
+	// 缓存key索引
 	keys      KeyIndex
 	scanned   bool
 	stageFull bool
@@ -157,12 +164,12 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 
 	c.createLockFile()
 	go c.checkLockFile()
-	go c.flush()
-	go c.checkFreeSpace()
+	go c.flush()          // 异步刷写数据到磁盘
+	go c.checkFreeSpace() // 磁盘剩余空间监控
 	if c.cacheExpire > 0 {
-		go c.cleanupExpire()
+		go c.cleanupExpire() // 异步清理过期数据
 	}
-	go c.refreshCacheKeys()
+	go c.refreshCacheKeys() // 异步刷新缓存key索引
 	go c.scanStaging()
 	go c.checkTimeout()
 	return c
@@ -430,6 +437,7 @@ func (cache *cacheStore) removeStage(key string) error {
 	return err
 }
 
+// 写入缓存
 func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 	if !cache.enabled() {
 		return
@@ -441,16 +449,21 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 	}
 	cache.Lock()
 	defer cache.Unlock()
+
+	// 先检查是否还在内存，没刷下去
 	if _, ok := cache.pages[key]; ok {
 		return
 	}
+	// 检查该key是否已经在磁盘
 	k := cache.getCacheKey(key)
 	if cache.keys.get(k) != nil {
 		return
 	}
 	p.Acquire()
+	// 如果没找到，即新缓存，加入内存page
 	cache.pages[key] = p
 	atomic.AddInt64(&cache.totalPages, int64(cap(p.Data)))
+	// 异步写入磁盘
 	select {
 	case cache.pending <- pendingFile{key, p, dropCache}:
 	default:
@@ -496,6 +509,7 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
+// 原子写入文件
 func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (err error) {
 	if !cache.available() {
 		return errCacheDown
@@ -507,6 +521,7 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (er
 	defer func() {
 		cache.m.cacheWriteHist.Observe(time.Since(start).Seconds())
 	}()
+	// 创建目录，先写一个临时文件
 	cache.createDir(filepath.Dir(path))
 	tmp := path + ".tmp"
 
@@ -545,6 +560,7 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (er
 		logger.Warnf("Close cache file %s failed: %s", tmp, err)
 		return
 	}
+	// 原子重命名临时文件到目标文件
 	if err = cache.renameFile(tmp, path); err != nil {
 		logger.Warnf("Rename cache file %s -> %s failed: %s", tmp, path, err)
 	}
@@ -638,12 +654,15 @@ func (cache *cacheStore) remove(key string, staging bool) {
 	}
 }
 
+// 读取缓存
 func (cache *cacheStore) load(key string) (ReadCloser, error) {
 	cache.Lock()
 	defer cache.Unlock()
+	//  先查内存
 	if p, ok := cache.pages[key]; ok {
 		return NewPageReader(p), nil
 	}
+	//  再查落盘索引，有则读取，否则报错
 	k := cache.getCacheKey(key)
 	if cache.scanned && cache.keys.get(k) == nil {
 		return nil, errNotCached
@@ -707,15 +726,19 @@ func (cache *cacheStore) stagePath(key string) string {
 }
 
 // flush cached block into disk
+// 后台异步刷写
 func (cache *cacheStore) flush() {
 	for {
 		w := <-cache.pending
 		path := cache.cachePath(w.key)
+		// 写数据
 		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache) == nil {
+			// 增加索引
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))
 		}
 		cache.Lock()
 		_, ok := cache.pages[w.key]
+		// 释放内存page
 		delete(cache.pages, w.key)
 		atomic.AddInt64(&cache.totalPages, -int64(cap(w.page.Data)))
 		cache.Unlock()
@@ -753,6 +776,9 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 	}
 }
 
+// 与cache()方法的区别
+// cache：直接写入内存，不保证持久化
+// stage：直接写入staging文件，持久化
 func (cache *cacheStore) stage(key string, data []byte) (string, error) {
 	stagingPath := cache.stagePath(key)
 	if cache.stageFull {
@@ -763,11 +789,13 @@ func (cache *cacheStore) stage(key string, data []byte) (string, error) {
 	}
 	stagingBlocks.Add(1)
 	defer stagingBlocks.Add(-1)
+	// 写入staging文件
 	err := cache.flushPage(stagingPath, data, false)
 	if err == nil {
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
 		cache.m.stageWriteBytes.Add(float64(len(data)))
+		// 在raw目录下创建硬连接
 		if cache.enabled() {
 			path := cache.cachePath(key)
 			cache.createDir(filepath.Dir(path))
@@ -1093,6 +1121,7 @@ type CacheManager interface {
 
 func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(key, path string, force bool) bool) CacheManager {
 	getEnvs()
+	// 默认一个缓存目录，var/jfsCache
 	metrics := newCacheManagerMetrics(reg)
 	if config.CacheDir == "memory" || !config.CacheEnabled() {
 		return newMemStore(config, metrics)
@@ -1185,6 +1214,7 @@ func (m *cacheManager) removeStore(id string) {
 	logger.Errorf("cache dir `%s`(%s) is unavailable, removed", dir, id)
 }
 
+// 通过一致性哈希找到key对应的store
 func (m *cacheManager) getStore(key string) *cacheStore {
 	for {
 		m.Lock()

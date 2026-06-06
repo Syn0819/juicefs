@@ -52,6 +52,7 @@ func NewOffPage(size int) *Page {
 	if pageStack {
 		page.stack = debug.Stack()
 	}
+	// GC回收page对象时，检查其引用计数，不为0则说明可能内存泄漏，报错
 	runtime.SetFinalizer(page, func(p *Page) {
 		refcnt := atomic.LoadInt32(&p.refs)
 		if refcnt != 0 {

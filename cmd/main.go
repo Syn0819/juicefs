@@ -269,6 +269,8 @@ func setup(c *cli.Context, n int) {
 	setup0(c, n, n)
 }
 
+// 解析参数、配置日志、设置代理、启动pyroscope
+// pyroscope是监控客户端
 func setup0(c *cli.Context, min, max int) {
 	if c.NArg() < min {
 		fmt.Printf("ERROR: This command requires at least %d arguments\n", min)

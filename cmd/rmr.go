@@ -53,6 +53,7 @@ $ juicefs rmr /mnt/jfs/foo`,
 	}
 }
 
+// 打开内部文件，对应到VFS.Open
 func openController(dpath string) (*os.File, error) {
 	st, err := os.Stat(dpath)
 	if err != nil {

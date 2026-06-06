@@ -133,6 +133,7 @@ func loadConfig(path string) (string, *vfs.Config, error) {
 	return "", nil, fmt.Errorf("%s is not inside JuiceFS", path)
 }
 
+// 监控挂载点是否还存活
 func watchdog(ctx context.Context, mp string) {
 	var lastActive int64
 	var pid int
@@ -142,11 +143,14 @@ func watchdog(ctx context.Context, mp string) {
 		time.Sleep(time.Millisecond * 100) // wait for child process
 		atomic.StoreInt64(&lastActive, time.Now().Unix())
 		for ctx.Err() == nil {
+			// 在挂载点目录下查找配置文件
 			var confName = ".config"
 			if !vfs.IsSpecialName(confName) {
 				confName = ".jfs" + confName
 			}
 			var confStat syscall.Stat_t
+			// watchdog只能使用普通文件系统调用，不能使用fuse
+			// 因此这里对mp/.config的stat操作会转发到fuse，而这些文件是固定inode的，需要进行比较来判断挂载是否正确
 			err := syscall.Stat(filepath.Join(mp, confName), &confStat)
 			ino, _ := vfs.GetInternalNodeByName(confName)
 			if err == nil && confStat.Ino == uint64(ino) {
@@ -156,6 +160,7 @@ func watchdog(ctx context.Context, mp string) {
 						dev = uint64(st.Dev)
 					}
 				}
+				// 只加载一次配置
 				if pid == 0 {
 					_, conf, err := loadConfig(mp)
 					if err == nil {
@@ -174,6 +179,8 @@ func watchdog(ctx context.Context, mp string) {
 	}()
 	for ctx.Err() == nil {
 		now := time.Now().Unix()
+		// 定期检查活跃时间是否更新，超过一定时间则认为卡住了，尝试打印堆栈
+		// 再超过一定时间则kill掉挂载进程
 		if atomic.LoadInt64(&lastActive)+30 < now {
 			showThreadStack(agentAddr)
 			time.Sleep(time.Second * 30)
@@ -494,6 +501,7 @@ func genFuseOpt(c *cli.Context, name string) string {
 	return fuseOpt
 }
 
+// 检查挂载点
 func prepareMp(mp string) {
 	if csiCommPath != "" {
 		return
@@ -506,6 +514,7 @@ func prepareMp(mp string) {
 		return err
 	}, time.Second*3)
 	if !strings.Contains(mp, ":") && err != nil {
+		// 如果目录不存在，创建
 		err2 := utils.WithTimeout(context.TODO(), func(context.Context) error {
 			return os.MkdirAll(mp, 0777)
 		}, time.Second*3)
@@ -519,6 +528,9 @@ func prepareMp(mp string) {
 			}
 		}
 	} else if err == nil {
+		// 如果目录存在，但 Inode 为 RootInode 且大小为 0
+		// inode = rootInode，即曾作为挂载点
+		// 视为损坏状态并执行自动卸载
 		ino, _ = utils.GetFileInode(mp)
 		if ino <= uint64(meta.RootInode) && fi.Size() == 0 {
 			// a broken mount point, umount it
@@ -712,6 +724,7 @@ func tellFstabOptions(c *cli.Context) string {
 	return strings.Join(opts, ",")
 }
 
+// 将当前挂载的所有参数格式化为一条记录写入fstab
 func updateFstab(c *cli.Context) error {
 	addr := expandPathForEmbedded(c.Args().Get(0))
 	mp := absPath(c.Args().Get(1))
@@ -759,6 +772,7 @@ func updateFstab(c *cli.Context) error {
 	return os.Rename(tempFstab, fstab)
 }
 
+// 需要将 JuiceFS 的可执行文件链接到 /sbin/mount.juicefs
 func tryToInstallMountExec() error {
 	if _, err := os.Stat("/sbin/mount.juicefs"); err == nil {
 		return nil
@@ -873,8 +887,12 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 		}
 	}()
 }
+
+// supervisor进程，启动并监控子进程执行挂载和服务
 func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
+	// 提高进程可用文件描述符上限
 	increaseRlimit()
+	// 降低被 OOM Killer 杀掉的概率
 	utils.AdjustOOMKiller(-1000)
 	utils.SetIOFlusher()
 
@@ -885,6 +903,8 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 	if canShutdownGracefully(mp, conf) {
 		shutdownGraceful(mp)
 	}
+	// _FUSE_FD_COMM 在监督进程与挂载进程之间传递fd
+	// 监督监控会监听这个服务地址
 	os.Setenv("_FUSE_FD_COMM", serverAddress)
 	serveFuseFD(serverAddress)
 	defer os.Remove(serverAddress)
@@ -910,6 +930,7 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 			}
 		}
 
+		// 启动挂载进程
 		mountPid = 0
 		cmd := exec.Command(path, os.Args[1:]...)
 		cmd.Stdin = os.Stdin
@@ -924,6 +945,7 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 		os.Unsetenv("_FUSE_STATE_PATH")
 		mountPid = cmd.Process.Pid
 
+		// 非CSI模式，需要将信号转发给挂载进程
 		notInCSI := os.Getenv("JFS_SUPER_COMM") == ""
 		signalChan := make(chan os.Signal, 10)
 		if notInCSI {
@@ -1066,4 +1088,3 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Fatalf("fuse: %s", err)
 	}
 }
-

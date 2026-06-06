@@ -36,17 +36,20 @@ import (
 )
 
 const (
-	minInternalNode = 0x7FFFFFFF00000000
-	logInode        = minInternalNode + 1
-	controlInode    = minInternalNode + 2
-	StatsInode      = minInternalNode + 3
-	ConfigInode     = minInternalNode + 4
-	trashInode      = meta.TrashInode
+	minInternalNode = 0x7FFFFFFF00000000  // 高位起始，避免冲突
+	logInode        = minInternalNode + 1 // 控制通道，通过写入命令执行操作
+	controlInode    = minInternalNode + 2 // 访问日志，记录文件系统操作
+	StatsInode      = minInternalNode + 3 // 统计信息
+	ConfigInode     = minInternalNode + 4 // 配置文件
+	trashInode      = meta.TrashInode     // 回收站目录
 )
 
 var controlMutex sync.Mutex
+
+// 记录哪个进程在调用 control 句柄，即key是 打开/读写 .control 的客户端进程的 PID
 var controlHandlers = make(map[uint32]uint64)
 
+// 一个pid对应一个handle，即一个fh
 func (v *VFS) getControlHandle(pid uint32) uint64 {
 	controlMutex.Lock()
 	defer controlMutex.Unlock()
@@ -83,11 +86,13 @@ var internalNodes = []*internalNode{
 	{trashInode, meta.TrashName, &Attr{Mode: 0555}},
 }
 
+// 设置内部文件的属性
 func init() {
 	uid := uint32(os.Getuid())
 	gid := uint32(os.Getgid())
 	now := time.Now().Unix()
 	for _, v := range internalNodes {
+		// 回收站是个目录
 		if v.inode == trashInode {
 			v.attr.Typ = meta.TypeDirectory
 			v.attr.Nlink = 2
@@ -185,6 +190,7 @@ func CollectMetrics(registry *prometheus.Registry) []byte {
 	return w.Bytes()
 }
 
+// 向控制通道定期写入异步操作的进度
 func writeProgress(item1, item2 *uint64, out io.Writer, done chan struct{}) {
 	wb := utils.NewBuffer(17)
 	wb.Put8(meta.CPROGRESS)
@@ -296,6 +302,8 @@ type chunkObj struct {
 	Size, Off, Len uint32
 }
 
+// 先起一个线程执行实际工作，周期性调用writeProgress向out写
+// 最后任务结束时向out中再写入执行结果信息
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
 	case meta.Rmr:

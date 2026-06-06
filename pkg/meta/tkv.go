@@ -1376,6 +1376,8 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 		}
 
 		defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
+		// 判断是否需要更新attr
+		// 计算当前时间与attr上次修改时间的时间差，如果超过了一定的阈值，就跳过更新
 		var updateParent bool
 		if !parent.IsTrash() && now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime*time.Duration(tx.retry+1) {
 			pattr.Mtime = now.Unix()
@@ -1385,11 +1387,14 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 			updateParent = true
 		}
 
+		// 删除父目录entry下该文件，之后就读不到该文件了
 		tx.delete(m.entryKey(parent, name))
 		if updateParent {
 			tx.set(m.inodeKey(parent), m.marshal(&pattr))
 		}
+		// 检查是否还需要保留 inode
 		if attr.Nlink > 0 {
+			// nlink大于0，说明还有其他硬连接引用，仅更新元数据
 			tx.set(m.inodeKey(inode), m.marshal(attr))
 			if trash > 0 {
 				tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
@@ -1401,12 +1406,19 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 				tx.incrBy(m.parentKey(inode, parent), -1)
 			}
 		} else {
+			// nlink为0说明可以删除
+			// 判断文件是否在当前session中打开
+			//   如果打开，仅更新元数据，不删除inode，因为可能有其他地方在访问
+			//   如果未打开，则删除inode
 			switch _type {
 			case TypeFile:
 				if opened {
 					tx.set(m.inodeKey(inode), m.marshal(attr))
+					// 创建 Sustained Key (SS)，将 Inode ID 绑定到当前 Session ID (sid)
+					// Key 格式: SS + Sid + Inode
 					tx.set(m.sustainedKey(m.sid, inode), []byte{1})
 				} else {
+					// 未打开，直接标记为待删除文件 (D Key)，准备后台清理数据
 					tx.set(m.delfileKey(inode, attr.Length), m.packInt64(now.Unix()))
 					tx.delete(m.inodeKey(inode))
 					newSpace, newInode = -align4K(attr.Length), -1
@@ -2736,23 +2748,45 @@ func (m *kvMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	return count, nil
 }
 
+// chunkKey 是 A{inode}C{indx}，存储该 chunk 所有 slice 的 byte 序列
+// 把 KV 中当前的实际值 buf2 与 compact 开始时的快照 buf（即 origin）做前缀比较
+// 把 N 条碎片 slice 替换成 1 条，同时不丢失并发写入的新 slice
 func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	st := errno(m.txn(Background(), func(tx *kvTxn) error {
 		buf2 := tx.get(m.chunkKey(inode, indx))
+		// len(buf2) < len(buf)：说明 chunk 的 slice 数量变少了（被其他操作截断）
+		// !bytes.Equal(buf, buf2[:len(buf)])：说明 buf 覆盖的那段 slice 内容被改变了
+		// 允许buf2比buf长，有新 slice 追加进来
 		if len(buf2) < len(buf) || !bytes.Equal(buf, buf2[:len(buf)]) {
 			logger.Infof("chunk %d:%d was changed %d -> %d", inode, indx, len(buf), len(buf2))
 			return syscall.EINVAL
 		}
 
+		// 	原始 buf2（旧状态）:
+		// ┌──────────────────────┬──────────────────────────────┬──────────────────────────┐
+		// │  skipped 部分        │  compacted 部分               │  新追加的 slice（buf后面）│
+		// │  (skipped * 24 字节) │  (len(compacted) * 24 字节)   │  (并发写入的新 slice)     │
+		// └──────────────────────┴──────────────────────────────┴──────────────────────────┘
+
+		// 替换后 buf2（新状态）:
+		// ┌──────────────────────┬───────────────┬──────────────────────────┐
+		// │  skipped 部分        │  新 slice     │  新追加的 slice           │
+		// │  (保持不变)          │  (1条 24字节) │  (保持不变)               │
+		// └──────────────────────┴───────────────┴──────────────────────────┘
 		buf2 = append(append(buf2[:skipped*sliceBytes], marshalSlice(pos, id, size, 0, size)...), buf2[len(buf):]...)
 		tx.set(m.chunkKey(inode, indx), buf2)
 		// create the key to tracking it
 		tx.set(m.sliceKey(id, size), make([]byte, 8))
+		// 如何删除旧slice？
+		// 如果开了回收站
+		// 把 dsbuf（所有被合并的旧 slice 的 id+size 列表）写入 L{timestamp}{id} key。后台 goroutine 定期扫描这类 key，到期后再真正删除对应的对象存储数据
 		if delayed != nil {
 			if len(delayed) > 0 {
 				tx.set(m.delSliceKey(time.Now().Unix(), id), delayed)
 			}
 		} else {
+			// 如果没有回收站
+			// 在事务内对每个旧 slice 的 sliceKey 做 -1（引用计数减 1）。注意这里遍历的是 ss（全部 slice），包括 skipped 的部分。这乍看有点奇怪——skipped 的 slice 没有被合并掉，不应该减引用计数。但实际上 skipped 的 slice 在新的 buf2 中仍然存在（buf2[:skipped*sliceBytes] 保留了它们），它们的引用计数不会真正降到 0，cleanupZeroRef 也不会删除它们
 			for _, s := range ss {
 				if s.id > 0 {
 					tx.incrBy(m.sliceKey(s.id, s.size), -1)
@@ -2762,6 +2796,8 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 		return nil
 	}, inode)) // less conflicts with `write`
 	// there could be false-negative that the compaction is successful, double-check
+	// 分布式 KV 事务可能出现"事务实际已提交，但客户端收到了错误"的 false-negative 情况
+	// 通过查询新 slice 的 sliceKey 是否存在来二次确认，如果key存在，说明事务成功，修改返回值
 	if st != 0 && st != syscall.EINVAL {
 		refs, e := m.get(m.sliceKey(id, size))
 		if e == nil {
@@ -2783,6 +2819,7 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 		m.cleanupZeroRef(id, size)
 		if delayed == nil {
 			var refs int64
+			// 没有回收站，遍历所有旧slice，如果引用计数小于0，则删除
 			for _, s := range ss {
 				if s.id > 0 && m.client.txn(Background(), func(tx *kvTxn) error {
 					refs = tx.incrBy(m.sliceKey(s.id, s.size), 0)

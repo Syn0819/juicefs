@@ -113,6 +113,7 @@ const (
 const MaxName = 255
 const MaxSymlink = 4096
 
+// 文件唯一标识
 type Ino uint64
 
 const RootInode Ino = 1
@@ -151,24 +152,35 @@ const CDATA = 0xFF     // 4 bytes: data length
 type MsgCallback func(...interface{}) error
 
 // Attr represents attributes of a node.
+// 文件元信息
 type Attr struct {
-	Flags     uint8  // flags
-	Typ       uint8  // type of a node
-	Mode      uint16 // permission mode
-	Uid       uint32 // owner id
-	Gid       uint32 // group id of owner
-	Rdev      uint32 // device number
-	Atime     int64  // last access time
-	Mtime     int64  // last modified time
+	Flags uint8 // flags
+	// 文件类型
+	Typ uint8 // type of a node
+	// 权限
+	Mode uint16 // permission mode
+	Uid  uint32 // owner id
+	Gid  uint32 // group id of owner
+	Rdev uint32 // device number
+	// 最后访问时间
+	Atime int64 // last access time
+	// 最后修改时间
+	Mtime int64 // last modified time
+	// 元数据变更时间
 	Ctime     int64  // last change time for meta
 	Atimensec uint32 // nanosecond part of atime
 	Mtimensec uint32 // nanosecond part of mtime
 	Ctimensec uint32 // nanosecond part of ctime
-	Nlink     uint32 // number of links (sub-directories or hardlinks)
-	Length    uint64 // length of regular file
+	// 链接数，对于目录，就是 2 + 子目录数；对于普通文件，就是硬链接数
+	Nlink uint32 // number of links (sub-directories or hardlinks)
+	// 文件长度，对于目录，固定为 4096；对于普通文件，就是文件实际内容的长度
+	Length uint64 // length of regular file
 
-	Parent    Ino  // inode of parent; 0 means tracked by parentKey (for hardlinks)
-	Full      bool // the attributes are completed or not
+	// 父目录inode
+	Parent Ino // inode of parent; 0 means tracked by parentKey (for hardlinks)
+	// 表示当前这份 Attr 是否“完整”
+	Full bool // the attributes are completed or not
+	// 是否建议内核保留页缓存，对应 FUSE 的 FOPEN_KEEP_CACHE
 	KeepCache bool // whether to keep the cached page or not
 
 	AccessACL  uint32 // access ACL id (identical ACL rules share the same access ACL ID.)
@@ -303,6 +315,7 @@ func (a *Attr) SMode() uint32 {
 }
 
 // Entry is an entry inside a directory.
+// 一个目录下的所有文件name
 type Entry struct {
 	Inode Ino
 	Name  []byte
@@ -359,6 +372,7 @@ type Plock struct {
 }
 
 // Session contains detailed information of a client session
+// 一个客户端实例
 type Session struct {
 	Sid    uint64
 	Expire time.Time
@@ -369,6 +383,14 @@ type Session struct {
 }
 
 // Meta is a interface for a meta service for file system.
+// 定义了元数据引擎的所有接口，关注逻辑，屏蔽底层存储差异
+// 可以分为以下几类：
+//
+//	命名空间
+//	属性
+//	数据块映射
+//	会话与锁
+//	运维
 type Meta interface {
 	// Name of database
 	Name() string

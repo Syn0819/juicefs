@@ -357,12 +357,14 @@ func (m *baseMeta) getDirParent(ctx Context, inode Ino) (Ino, syscall.Errno) {
 }
 
 // get inode of the first parent (or myself) with quota
+// 查找第一个有quota的父目录
 func (m *baseMeta) getQuotaParent(ctx Context, inode Ino) (Ino, *Quota) {
 	if !m.getFormat().DirStats {
 		return 0, nil
 	}
 	var q *Quota
 	var st syscall.Errno
+	// 不断向上找到第一个有quota的目录
 	for {
 		m.quotaMu.RLock()
 		q = m.dirQuotas[uint64(inode)]
@@ -382,6 +384,7 @@ func (m *baseMeta) getQuotaParent(ctx Context, inode Ino) (Ino, *Quota) {
 	return 0, nil
 }
 
+// 创建/写入/rename 前检查目录配额，沿父链向上检查
 func (m *baseMeta) checkDirQuota(ctx Context, inode Ino, space, inodes int64) bool {
 	if !m.getFormat().DirStats {
 		return false

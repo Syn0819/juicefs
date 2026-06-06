@@ -268,36 +268,42 @@ type baseMeta struct {
 	conf *Config
 	fmt  *Format
 
-	root         Ino
+	// 根inode，Chroot 后可能指向子目录
+	root Ino
+	// 并发控制，分布式事务 锁优化
 	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
-	subTrash     internalNode
-	sid          uint64
-	of           *openfiles
+	subTrash     internalNode       // 当前根下的「回收站」目录的 inode + name
+	sid          uint64             // session id，标识挂载点/客户端
+	of           *openfiles         // 文件句柄缓存
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
 	maxDeleting  chan struct{}
 	dslices      chan Slice // slices to delete
 	symlinks     *symlinkCache
-	msgCallbacks *msgCallbacks
+	msgCallbacks *msgCallbacks // 按消息类型注册的回调，因为有些代码在其他模块
 	reloadCb     []func(*Format)
-	umounting    bool
-	sesMu        sync.Mutex
+	umounting    bool       // 是否正在卸载；为 true 时 refresh 等会停止发心跳、不再做后台任务
+	sesMu        sync.Mutex // 保护会话相关状态
 	aclCache     aclAPI.Cache
 
-	sessCtx Context
-	sessWG  sync.WaitGroup
+	sessCtx Context        // 会话级 Context
+	sessWG  sync.WaitGroup // 会话 goroutine 的 WaitGroup；CloseSession 时 Cancel + Wait，保证后台任务都结束再退出。
 
-	dSliceMu sync.Mutex
-	dSliceWG sync.WaitGroup
+	// 异步删除slice
+	dSliceMu sync.Mutex     // 保护对 dslices channel 的创建/关闭
+	dSliceWG sync.WaitGroup // 删除 slice 的 worker 数量
 
+	// 目录统计与配额
 	dirStatsLock sync.Mutex
 	dirStats     map[Ino]dirStat
 
 	fsStatsLock sync.Mutex
 	*fsStat
 
-	parentMu    sync.Mutex        // protect dirParents
-	quotaMu     sync.RWMutex      // protect dirQuotas
+	parentMu sync.Mutex   // protect dirParents
+	quotaMu  sync.RWMutex // protect dirQuotas
+	// key是目录inode，value是其父目录inode
+	// 在quota功能使用
 	dirParents  map[Ino]Ino       // directory inode -> parent inode
 	dirQuotas   map[uint64]*Quota // directory inode -> quota
 	userQuotas  map[uint64]*Quota // uid -> quota
@@ -630,6 +636,7 @@ func (r *baseMeta) txUnlock(idx uint) {
 	r.txlocks[idx%nlocks].Unlock()
 }
 
+// 批量上锁
 func (r *baseMeta) txBatchLock(inodes ...Ino) func() {
 	switch len(inodes) {
 	case 0:
@@ -638,10 +645,12 @@ func (r *baseMeta) txBatchLock(inodes ...Ino) func() {
 		r.txLock(uint(inodes[0]))
 		return func() { r.txUnlock(uint(inodes[0])) }
 	default: // for rename and more
+		// 把每个inode计算到对应slot
 		inodeSlots := make([]int, len(inodes))
 		for i, ino := range inodes {
 			inodeSlots[i] = int(ino % nlocks)
 		}
+		// 排序后去重
 		sort.Ints(inodeSlots)
 		uniqInodeSlots := inodeSlots[:0]
 		for i := 0; i < len(inodeSlots); i++ { // Go does not support recursive locks
@@ -649,9 +658,11 @@ func (r *baseMeta) txBatchLock(inodes ...Ino) func() {
 				uniqInodeSlots = append(uniqInodeSlots, inodeSlots[i])
 			}
 		}
+		// 按固定顺序逐个加锁
 		for _, idx := range uniqInodeSlots {
 			r.txlocks[idx].Lock()
 		}
+		// 返回闭包统一解锁
 		return func() {
 			for _, idx := range uniqInodeSlots {
 				r.txlocks[idx].Unlock()
@@ -1269,7 +1280,9 @@ func (r *baseMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, att
 	return syscall.ENOTSUP
 }
 
+// 检查访问权限
 func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) syscall.Errno {
+	// rrot用户不检查
 	if ctx.Uid() == 0 {
 		return 0
 	}
@@ -1277,6 +1290,7 @@ func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) sysca
 		return 0
 	}
 
+	// 有些路径不会传attr，比如opendir、lookup，只知道inode
 	if attr == nil || !attr.Full {
 		if attr == nil {
 			attr = &Attr{}
@@ -1767,8 +1781,10 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	if attr == nil {
 		attr = &Attr{}
 	}
+	// 可能上层挂载的是子目录视图，需要转换为真实inode
 	parentSrc = m.checkRoot(parentSrc)
 	parentDst = m.checkRoot(parentDst)
+	// 沿父目录找到有配额的父目录
 	var quotaSrc, quotaDst Ino
 	if !parentSrc.IsTrash() {
 		quotaSrc, _ = m.getQuotaParent(ctx, parentSrc)
@@ -1780,9 +1796,11 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	}
 	var space, inodes int64
 	if quotaSrc != quotaDst {
+		// 找到源文件的inode attr
 		if st := m.Lookup(ctx, parentSrc, nameSrc, inode, attr, false); st != 0 {
 			return st
 		}
+		// 如果是目录，则需要计算目录使用空间
 		if attr.Typ == TypeDirectory {
 			m.quotaMu.RLock()
 			q := m.dirQuotas[uint64(*inode)]
@@ -1799,6 +1817,7 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				space, inodes = int64(sum.Size), int64(sum.Dirs+sum.Files)
 			}
 		} else {
+			// 如果是文件，4k对齐获得需要的空间
 			space, inodes = align4K(attr.Length), 1
 		}
 		// TODO: dst exists and is replaced or exchanged
@@ -1810,14 +1829,18 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	tattr := new(Attr)
 	st := m.en.doRename(ctx, parentSrc, nameSrc, parentDst, nameDst, flags, inode, tinode, attr, tattr)
 	if st == 0 {
+		// 持久化成功，更新内存状态
 		var diffLength uint64
+		// 如果被移动的是目录，需要更新其父目录缓存，inode目前挂在parentDst
 		if attr.Typ == TypeDirectory {
 			m.parentMu.Lock()
 			m.dirParents[*inode] = parentDst
 			m.parentMu.Unlock()
 		} else if attr.Typ == TypeFile {
+			// 如果被移动的是文件，表示从 src 父目录“减掉”、向 dst 父目录“加上”的逻辑长度/空间
 			diffLength = attr.Length
 		}
+		// 如果src和dst不是同一个目录，需要更新统计和配额
 		if parentSrc != parentDst {
 			m.updateDirStat(ctx, parentSrc, -int64(diffLength), -align4K(diffLength), -1)
 			m.updateDirStat(ctx, parentDst, int64(diffLength), align4K(diffLength), 1)
@@ -1833,6 +1856,8 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				m.updateUserGroupQuota(ctx, attr.Uid, attr.Gid, align4K(diffLength), 1)
 			}
 		}
+		// 当目标原来有条目且被覆盖（*tinode > 0）且不是 Exchange时( exchange交换目录项，条目数/空间不变，可以跳过
+		// 否则更新quota
 		if *tinode > 0 && flags != RenameExchange {
 			diffLength = 0
 			if tattr.Typ == TypeDirectory {
@@ -1886,6 +1911,7 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 			m.touchAtime(ctx, inode, attr)
 		}
 	}()
+	// 如果配置了缓存，并且缓存中存在该文件，则直接返回
 	if m.conf.OpenCache > 0 && m.of.OpenCheck(inode, attr) {
 		return 0
 	}
@@ -1946,6 +1972,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		f.RLock()
 		defer f.RUnlock()
 	}
+	// 优先从缓存的句柄中读取slice信息
 	if ss, ok := m.of.ReadChunk(inode, indx); ok {
 		*slices = ss
 		return 0
@@ -1953,6 +1980,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 
 	*slices = nil
 	defer m.timeit("Read", time.Now())
+	// 如果内存中没有，则从持久化数据中读取
 	ss, st := m.en.doRead(ctx, inode, indx)
 	if st != 0 {
 		return st
@@ -1971,8 +1999,10 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		return 0
 	}
 
+	// 转换为逻辑上连续的视图
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
+	// 如果非只读，并且slice数量大于5，则异步合并
 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
 		go m.compactChunk(inode, indx, false, false)
 	}
@@ -2010,23 +2040,38 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 	return 0
 }
 
+// 提交slice元数据
 func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
 	defer m.timeit("Write", time.Now())
+	// 尝试从缓存中获取句柄
 	f := m.of.find(inode)
 	if f != nil {
 		f.Lock()
 		defer f.Unlock()
 	}
+	// 无论持久化是否成功，这里都要失效掉内存中关于该chunk的缓存
+	// 因为可能会追加新的slice，导致缓存的slice列表已经过期
 	defer func() { m.of.InvalidateChunk(inode, indx) }()
 	var numSlices int
 	var delta dirStat
 	var attr Attr
+	// 持久化
+	// 返回值：
+	//		numSlices：当前chunk的slice数量
+	//		delta：文件大小和空间占用的变化量
+	//		attr：最新的文件属性
 	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
+		// 如果写入成功，需要向上传导状态变化，包括更新父目录大小统计，更新用户和group配额
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		if delta.space != 0 {
 			m.updateUserGroupQuota(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		}
+		// 针对随机写优化
+		// 如果在同一个 Chunk（64MB）上发生了成千上万次小块随机写，数据库中该 Chunk 对应的 Slice 列表会变得非常长
+		// 所以每增加约 100 个 Slice，或者 Slice 总数超过 350 时，触发合并
+		// 		如果不算太多（< maxSlices，默认 2500），使用 go 协程异步合并，不阻塞当前写入
+		// 		如果太多了（>= 2500），强制同步合并，防止系统过载
 		if numSlices%100 == 99 || numSlices > 350 {
 			if numSlices < maxSlices {
 				go m.compactChunk(inode, indx, false, false)
@@ -2045,6 +2090,7 @@ func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, 
 		f.Lock()
 		defer f.Unlock()
 	}
+	// 所有chunk都失效
 	defer func() { m.of.InvalidateChunk(inode, invalidateAllChunks) }()
 	if attr == nil {
 		attr = &Attr{}
@@ -2631,6 +2677,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		m.Unlock()
 		return
 	}
+	// 如果同一chunk正在compact，且指定once或者强制执行，会循环等待
 	if once || force {
 		for m.compacting[k] {
 			m.Unlock()
@@ -2638,6 +2685,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 			m.Lock()
 		}
 	} else if len(m.compacting) > 10 || m.compacting[k] {
+		// 如果全局并发compact的chunk多，大于10，则直接放弃
 		m.Unlock()
 		return
 	}
@@ -2649,6 +2697,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		m.Unlock()
 	}()
 
+	// 读取当前chunk的slice列表
 	ss, st := m.en.doRead(Background(), inode, indx)
 	if st != 0 {
 		return
@@ -2657,18 +2706,22 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		logger.Errorf("Corrupt value for inode %d chunk indx %d", inode, indx)
 		return
 	}
+	// 如果指定once，只有slice数量大于2500时，才执行compact，防止频繁
 	if once && len(ss) < maxSlices {
 		return
 	}
+	// 单次最多处理1000条，控制单次compact的耗时
 	if len(ss) > maxCompactSlices {
 		ss = ss[:maxCompactSlices]
 	}
+	// 跳过一些没必要的slice
 	skipped := skipSome(ss)
 	compacted := ss[skipped:]
 	pos, size, slices := compactChunk(compacted)
 	if len(compacted) < 2 || size == 0 {
 		return
 	}
+	// 校验，跳过的slice和压缩的slice区域不能重叠
 	for _, s := range ss[:skipped] {
 		if pos+size > s.pos && s.pos+s.len > pos {
 			var sstring string
@@ -2692,6 +2745,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		return
 	}
 
+	// 如果开了回收站，不能立即删除旧对象，需要把被合并掉的旧slice（id > 0)，编码成dsbuf
 	var dsbuf []byte
 	trash := m.toTrash(0)
 	if trash {
@@ -2702,11 +2756,14 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 			}
 		}
 	}
+	// 读取的完整 slice 列表快照
 	origin := make([]byte, 0, len(ss)*sliceBytes)
 	for _, s := range ss {
 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
 	}
 	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+	// 类似CAS设计，如果失败，chunk 在此期间被修改，本次 compact 作废
+	// 调用 deleteSlice 删除已写到对象存储的新对象
 	if st == syscall.EINVAL {
 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
 		m.deleteSlice(id, size)
@@ -3603,6 +3660,7 @@ func (m *baseMeta) NewDirHandler(ctx Context, inode Ino, plus bool, initEntries 
 		Name:  []byte(".."),
 		Attr:  &Attr{Typ: TypeDirectory},
 	}
+	// 处理父目录，如果是plus模式，需要获取父目录的attr
 	if plus {
 		if attr.Parent == inode {
 			parent.Attr = &attr
@@ -3673,6 +3731,7 @@ func (h *dirHandler) fetch(ctx Context, offset int) (*dirBatch, error) {
 }
 
 func (h *dirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno) {
+	// 去除 内部节点 entry
 	var prefix []*Entry
 	if offset < len(h.initEntries) {
 		prefix = h.initEntries[offset:]
@@ -3692,6 +3751,7 @@ func (h *dirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno) {
 		return nil, errno(err)
 	}
 
+	// 记录 当前已经读到的位置
 	h.readOff = h.batch.offset + len(h.batch.entries)
 	if len(prefix) > 0 {
 		return append(prefix, h.batch.entries...), 0

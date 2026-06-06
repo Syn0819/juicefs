@@ -50,14 +50,20 @@ type DataWriter interface {
 }
 
 type sliceWriter struct {
-	id      uint64
-	chunk   *chunkWriter
-	off     uint32
-	length  uint32
-	soff    uint32
-	slen    uint32
-	writer  chunk.Writer
+	// slice ID
+	id    uint64
+	chunk *chunkWriter
+	// 该 slice 在 chunk 内的起始偏移
+	off    uint32
+	length uint32
+	// 该 slice 在 chunk 内的逻辑偏移和长度
+	soff uint32
+	slen uint32
+	// 内存写缓存
+	writer chunk.Writer
+	// 是否已冻结，表示已准备好flush
 	freezed bool
+	// 是否flush完成
 	done    bool
 	err     syscall.Errno
 	notify  *utils.Cond
@@ -65,6 +71,7 @@ type sliceWriter struct {
 	lastMod time.Time
 }
 
+// 向meta获取全局唯一的slice ID
 func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
 	f := s.chunk.file
 	f.Lock()
@@ -103,6 +110,12 @@ func (s *sliceWriter) markDone() {
 }
 
 // freezed, no more data
+// 把slice writer内存中的数据上传到store
+// 调用场景：
+//  1. 当前slice写满64MB
+//  2. 未刷写的slice太多
+//  3. commit线程，如果发现slice一段时间 既不满也不刷，强制freezed，并刷写
+//  4. 用户主动调用
 func (s *sliceWriter) flushData() {
 	defer s.markDone()
 	if s.slen == 0 {
@@ -151,12 +164,16 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 }
 
 type chunkWriter struct {
-	indx   uint32
-	file   *fileWriter
+	// chunk index
+	indx uint32
+	// 所属fileWriter
+	file *fileWriter
+	// 该chunk下的slice列表，按创建顺序排列
 	slices []*sliceWriter
 }
 
 // protected by file
+// 在现有slice中找一个足够空间的slice，如果找不到，则返回nil
 func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	blockSize := uint32(c.file.w.blockSize)
 	for i := range c.slices {
@@ -166,10 +183,12 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 			if pos >= s.off+flushoff && pos <= s.off+s.slen {
 				return s
 			} else if i > 3 {
+				// 如果没flush的slice已经多于3个，强制刷
 				s.freezed = true
 				go s.flushData()
 			}
 		}
+		// 不能有重叠范围
 		if pos < s.off+s.slen && s.off < pos+size {
 			// overlaped
 			// TODO: write into multiple slices
@@ -181,14 +200,18 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 
 func (c *chunkWriter) commitThread() {
 	f := c.file
+	// 减少file writer的引用计数，可以确保其释放
 	defer f.w.free(f)
 	f.Lock()
 
 	// the slices should be committed in the order that are created
+	// 按创建顺序，依次commit
 	for len(c.slices) > 0 {
 		s := c.slices[0]
+		// 等待slice写store完成
 		for !s.done {
 			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
+				// 如果slice写store超时，强制刷
 				s.freezed = true
 				go s.flushData()
 			}
@@ -196,14 +219,17 @@ func (c *chunkWriter) commitThread() {
 		err := s.err
 		f.Unlock()
 
+		// 如果slice写store成功，写入元数据
 		if err == 0 {
 			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
 			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
+			// 使读缓存失效，确保后续读取到最新数据
 			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
 		}
 
 		f.Lock()
 		if err != 0 {
+			// 对于 文件不存在、空间不足、配额不足，异步清理删除slice已经写入store的数据，避免空间浪费
 			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
 				go func(id uint64, length int) {
 					_ = f.w.store.Remove(id, length)
@@ -225,13 +251,16 @@ type fileWriter struct {
 	sync.Mutex
 	w *dataWriter
 
-	inode        Ino
-	length       uint64
-	err          syscall.Errno
+	inode Ino
+	// 当前文件长度
+	length uint64
+	err    syscall.Errno
+	// flush和write等待计数，用于互斥，确保flush时不并发write
 	flushwaiting uint16
 	writewaiting uint16
 	refs         uint16
-	chunks       map[uint32]*chunkWriter
+	// 按chunk index映射的chunkWriter
+	chunks map[uint32]*chunkWriter
 
 	flushcond *utils.Cond // wait for chunks==nil (flush)
 	writecond *utils.Cond // wait for flushwaiting==0 (write)
@@ -256,6 +285,7 @@ func (f *fileWriter) freeChunk(c *chunkWriter) {
 }
 
 // protected by file
+// 将数据写入对应的chunk
 func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data []byte) syscall.Errno {
 	c := f.findChunk(indx)
 	s := c.findWritableSlice(off, uint32(len(data)))
@@ -267,8 +297,10 @@ func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data 
 			notify:  utils.NewCond(&f.Mutex),
 			started: time.Now(),
 		}
+		// 这里尝试获取Slice ID，失败也没事，在写入元数据之前都不阻碍，在flushData时会再次调用
 		go s.prepareID(meta.Background(), false)
 		c.slices = append(c.slices, s)
+		// 如果这是第一个slice，启动commit线程
 		if len(c.slices) == 1 {
 			f.w.Lock()
 			f.refs++
@@ -294,12 +326,16 @@ func (w *dataWriter) usedBufferSize() int64 {
 }
 
 func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Errno {
+	// 统计该file writer下所有chunk的所有slice总数
+	// 如果大于1000个，则sleep 1ms，直到小于1000个为止
+	// 控制内存占用、避免slice太多导致commit太多
 	for {
 		if f.totalSlices() < 1000 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// 内存使用限制
 	if f.w.usedBufferSize() > f.w.bufferSize {
 		// slow down
 		time.Sleep(time.Millisecond * 10)
@@ -312,7 +348,9 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	f.Lock()
 	defer f.Unlock()
 	size := uint64(len(data))
+	// 增加写等待计数，表示有写请求进来
 	f.writewaiting++
+	// 如果有flush在进行，等待完成，或者超时
 	for f.flushwaiting > 0 {
 		if f.writecond.WaitWithTimeout(time.Second) && ctx.Canceled() {
 			f.writewaiting--
@@ -320,10 +358,13 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 			return syscall.EINTR
 		}
 	}
+	// flush完成，减少等待计数
 	f.writewaiting--
 
+	// 计算chunk 索引和内部偏移
 	indx := uint32(off / meta.ChunkSize)
 	pos := uint32(off % meta.ChunkSize)
+	// 循环拆分请求，按chunk纬度，默认64M，然后写入缓存
 	for len(data) > 0 {
 		n := uint32(len(data))
 		if pos+n > meta.ChunkSize {
@@ -336,6 +377,7 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 		indx++
 		pos = (pos + n) % meta.ChunkSize
 	}
+	// 如果写后的长度大于当前记录的文件长度，更新长度
 	if off+size > f.length {
 		f.length = off + size
 	}
@@ -364,6 +406,8 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 		wait = time.Minute * 5
 	}
 	var deadline = time.Now().Add(wait)
+	// 上锁，把当前文件的所有slice都刷下去
+	// 每个slice并发刷
 	for len(f.chunks) > 0 && err == 0 {
 		for _, c := range f.chunks {
 			for _, s := range c.slices {

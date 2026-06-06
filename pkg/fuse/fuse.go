@@ -36,6 +36,7 @@ import (
 
 var logger = utils.GetLogger("juicefs")
 
+// posix使用
 type fileSystem struct {
 	fuse.RawFileSystem
 	conf *vfs.Config
@@ -387,6 +388,7 @@ func (fs *fileSystem) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse
 	return fuse.Status(err)
 }
 
+// 获取readaddr + attr
 func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
@@ -397,14 +399,17 @@ func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *
 		de.Ino = uint64(e.Inode)
 		de.Name = string(e.Name)
 		de.Mode = e.Attr.SMode()
+		// 把每个entry预留空间
 		eo := out.AddDirLookupEntry(de)
 		if eo == nil {
 			fs.v.UpdateReaddirOffset(ctx, Ino(in.NodeId), in.Fh, int(in.Offset)+i)
 			break
 		}
 		if e.Attr.Full {
+			// 如果meta返回了完整attr，写入预留好的buf位置
 			fs.replyEntry(ctx, eo, e)
 		} else {
+			// 返回的attr不完整，只填写最少信息
 			eo.Ino = uint64(e.Inode)
 			eo.Generation = 1
 		}

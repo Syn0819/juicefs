@@ -25,6 +25,7 @@ type Reader interface {
 	ReadAt(ctx context.Context, p *Page, off int) (int, error)
 }
 
+// 实现是wSlice
 type Writer interface {
 	io.WriterAt
 	ID() uint64
@@ -35,6 +36,7 @@ type Writer interface {
 	Abort()
 }
 
+// 实现是cachedStore
 type ChunkStore interface {
 	NewReader(id uint64, length int) Reader
 	NewWriter(id uint64) Writer

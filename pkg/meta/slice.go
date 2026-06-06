@@ -131,18 +131,25 @@ func readSliceBuf(buf []byte) []*slice {
 	return ss
 }
 
+// 将slice列表转换为逻辑上连续的视图
 func buildSlice(ss []*slice) []Slice {
 	var root *slice
+	// 遍历所有的slice，后面覆盖前面
 	for i := range ss {
 		s := new(slice)
 		*s = *ss[i]
 		var right *slice
+		// 将当前根节点在s.pos位置切开，得到左子树和右子树（包括s覆盖的内容和s之后的内容
 		s.left, right = root.cut(s.pos)
+		// 将右子树从新slice的终点处切分，得到的右子树是没有覆盖内容的部分
 		_, s.right = right.cut(s.pos + s.len)
+		// s 成为新的 root
+		// 现在的结构是: [旧的左边内容] <--- s ---> [旧的右边内容]
 		root = s
 	}
 	var pos uint32
 	var chunk []Slice
+	// 最后通过 root.visit 进行中序遍历。由于树的结构保证了 left < self < right 的位置关系，遍历结果自然就是按文件偏移量排序的、无重叠的最终文件片段
 	root.visit(func(s *slice) {
 		if s.pos > pos {
 			chunk = append(chunk, Slice{Size: s.pos - pos, Len: s.pos - pos})
@@ -180,14 +187,24 @@ func compactChunk(ss []*slice) (uint32, uint32, []Slice) {
 	return pos, size, chunk
 }
 
+// 跳过一些不需要整理的slice
 func skipSome(chunk []*slice) int {
 	var skipped int
 	var total = len(chunk)
 OUT:
 	for skipped < total {
+		// 取出当前尚未被跳过的剩余 slice 列表
 		ss := chunk[skipped:]
+		// 模拟合并剩余的 slice
+		// pos 合并后起始偏移量
+		// size 合并后总有效数据大小
+		// c 合并后的slice数组
 		pos, size, c := compactChunk(ss)
 		first := ss[0]
+		// 如果第一个slice大小小于1MB
+		// 或者第一个slice大小5倍小于合并后总有效数据大小
+		// 或者合并后总有效数据大小为0
+		// 不能跳过合并
 		if first.len < (1<<20) || first.len*5 < size || size == 0 {
 			// it's too small
 			break
@@ -195,10 +212,16 @@ OUT:
 		isFirst := func(pos uint32, s Slice) bool {
 			return pos == first.pos && s.Id == first.id && s.Off == first.off && s.Len == first.len
 		}
+		// 对比合并后的第一个slice 与 合并前的第一个slice
+		// 如果不一致，说明后面的 Slice 覆盖写了这个 first 的头部或改变了它的有效范围
+		// 既然它被“污染”或截断了，那它就不能跳过，必须参与实际的合并重写
 		if !isFirst(pos, c[0]) {
 			// it's not the first slice, compact it
 			break
 		}
+		// 遍历剩余 Slice
+		// 如果发现后面有一个 Slice 的各项属性和当前的 first 一模一样，这通常意味着冗余写入或者某种特殊的重试/异常状态
+		// 直接退出，进行实际的合并重写
 		for _, s := range ss[1:] {
 			if *s == *first {
 				break OUT
